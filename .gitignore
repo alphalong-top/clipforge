@@ -45,6 +45,9 @@ CLAUDE.md
 AGENTS.md
 .claude/
 
+# local research cache
+/.firecrawl/
+
 # vercel
 .vercel
 
