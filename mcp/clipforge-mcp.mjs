@@ -36,6 +36,7 @@ const NARRATION_STYLES = ["knowledge", "story", "lifestyle", "inspiration", "tra
 const FOOTAGE_KINDS = ["auto", "image", "video"];
 const ASPECT_RATIOS = ["9:16", "16:9", "1:1"]; // 9:16 portrait (Douyin/Kuaishou/Reels/Shorts) · 16:9 landscape · 1:1 square
 const QUALITY_PRESETS = ["fast", "standard", "hd"]; // maps to real FFmpeg encoding: resolution + x264 preset + crf
+const CAPTION_PRESETS = ["standard", "bold", "minimal", "karaoke"]; // caption style presets (mirrors src/lib/caption-presets.ts)
 
 /** footage resolution: default "auto" — delegates to stock-fill per shot ("video first, fall back to image" — fully key-free); image/video are explicit overrides */
 function resolveMediaType(footage) {
@@ -52,6 +53,7 @@ function composeBody(args) {
   if (["upbeat", "chill", "energetic", "emotional"].includes(args.bgmMood)) body.bgmMood = args.bgmMood; // BGM mood
   if (args.bgmDuck === true) body.bgmDuck = true; // voiceover ducking (makes narration clearer)
   if (args.karaoke === true) body.karaoke = true; // karaoke word-by-word captions
+  if (CAPTION_PRESETS.includes(args.captionPreset)) body.captionPreset = args.captionPreset; // caption style preset
   if (args.productCard === true) body.productCard = true; // product card overlay (only applies when product image exists)
   if (args.aiDisclosure === true) body.aiDisclosure = true; // AI compliance disclosure label
   if (typeof args.ctaText === "string" && args.ctaText.trim()) body.ctaText = args.ctaText.trim(); // end-card purchase CTA
@@ -85,6 +87,12 @@ const OUTPUT_OPTION_PROPS = {
   karaoke: {
     type: "boolean",
     description: "卡拉OK逐字高亮字幕（整句留屏、逐字随旁白变色，2026 爆款字幕样式）。默认 false（默认是 rapid 短句卡字幕）",
+  },
+  captionPreset: {
+    type: "string",
+    enum: CAPTION_PRESETS,
+    description:
+      "字幕样式预设：standard 白字半透明底板（默认）/ bold 大号粗描边无底板（高留存爆款风）/ minimal 小号细描边（纪实干净画面）/ karaoke 逐字高亮（等价 karaoke=true）",
   },
   productCard: {
     type: "boolean",
@@ -455,6 +463,20 @@ const TOOLS = [
         startSec: { type: "number", description: "起始秒，默认 0" },
         durationSec: { type: "number", description: "时长秒（1-10），默认 4" },
         width: { type: "number", description: "宽度 px，默认 360" },
+      },
+      required: ["projectId"],
+    },
+  },
+  {
+    name: "clipforge_contact_sheet",
+    description:
+      "把某项目最新成片渲成一张速览图（均匀抽帧胶片条 + 音频波形 PNG）。合成后建议调用并查看这张图，一眼确认黑屏/字幕遮挡/爆音/静音尾巴，再告知用户成片可用。需先合成过视频。不需要 LLM。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", description: "项目 ID" },
+        frames: { type: "number", description: "胶片条帧数（4-12），默认 8" },
+        thumbWidth: { type: "number", description: "单帧宽度 px（120-320），默认 180" },
       },
       required: ["projectId"],
     },
@@ -848,6 +870,18 @@ async function handlePreviewGif(args) {
   return ok({ ok: true, projectId, gif: res.gif ? `${BASE_URL}${res.gif}` : null });
 }
 
+// Contact sheet: one-image overview (filmstrip + waveform) of the latest composed video — the
+// agent-side eyeball check: fetch the PNG and *look* at it before telling the user the video is good
+async function handleContactSheet(args) {
+  const projectId = String(args.projectId || "").trim();
+  if (!projectId) throw new Error("projectId 不能为空");
+  const body = {};
+  if (Number.isFinite(args.frames)) body.frames = args.frames;
+  if (Number.isFinite(args.thumbWidth)) body.thumbWidth = args.thumbWidth;
+  const res = await api(`/api/project/${projectId}/contact-sheet`, { method: "POST", body });
+  return ok({ ok: true, projectId, sheet: res.sheet ? `${BASE_URL}${res.sheet}` : null, layout: res.layout ?? null });
+}
+
 // Export the project's subtitles as SRT/WebVTT (the route returns text, wrapped as { raw } by api())
 async function handleExportSubtitle(args) {
   const projectId = String(args.projectId || "").trim();
@@ -891,6 +925,7 @@ const HANDLERS = {
   clipforge_credits: handleCredits,
   clipforge_native_feel: handleNativeFeel,
   clipforge_preview_gif: handlePreviewGif,
+  clipforge_contact_sheet: handleContactSheet,
   clipforge_export_subtitle: handleExportSubtitle,
   clipforge_carousel: handleCarousel,
 };

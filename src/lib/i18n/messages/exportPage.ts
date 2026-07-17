@@ -46,7 +46,7 @@ export const exportPage: NamespaceMessages = {
     publishAiDeclLabel: "AI 内容声明（点击复制声明句）",
     // 更多产出（变现/出海）
     moreTitle: "更多产出",
-    moreDesc: "一键生成封面、图文卡片、扫码购买二维码、片尾扫码成片、多语言译制版——全部复用成片，免额外操作。",
+    moreDesc: "一键生成封面、图文卡片、扫码购买二维码、片尾扫码成片——全部复用成片，免额外操作。",
     moreGenerate: "生成",
     moreFailed: "生成失败，请重试",
     moreCover: "封面图（提升点击率）",
@@ -65,6 +65,9 @@ export const exportPage: NamespaceMessages = {
     qcTitle: "成片质检",
     qcRun: "运行质检",
     qcHint: "发布前自动检查成片：黑屏、长静音、响度漂移、画面冻结、流完整性。批量出片必备把关。",
+    sheetTitle: "成片速览",
+    sheetRun: "生成速览图",
+    sheetHint: "把整条成片浓缩成一张图：均匀抽帧胶片条 + 音频波形。一眼看出黑屏、字幕遮挡、爆音和静音尾巴，点击可看大图。",
     qcPass: "质检通过，可放心发布",
     qcWarn: "质检有警告，建议人工复核",
     qcFail: "质检不通过，请勿直接发布",
@@ -95,6 +98,9 @@ export const exportPage: NamespaceMessages = {
     exporting: "导出中...",
     retryExport: "重试导出",
     exportFailed: "导出失败",
+    // advanced tools collapsible section
+    advancedTitle: "进阶工具",
+    advancedHint: "效果回流 · A/B 测试 · 质检与合规",
     // A/B 测试
     abTitle: "A/B 变体",
     abBadge: "开发中",
@@ -168,7 +174,7 @@ export const exportPage: NamespaceMessages = {
     publishAiDeclLabel: "AI content disclosure (click to copy the line)",
     // more outputs (monetization / localization)
     moreTitle: "More outputs",
-    moreDesc: "One click to generate a cover, image cards, a scan-to-buy QR, a QR end-card video, and dubbed versions — all reuse the finished video, no extra setup.",
+    moreDesc: "One click to generate a cover, image cards, a scan-to-buy QR, and a QR end-card video — all reuse the finished video, no extra setup.",
     moreGenerate: "Generate",
     moreFailed: "Generation failed, please retry",
     moreCover: "Cover (boosts CTR)",
@@ -187,6 +193,9 @@ export const exportPage: NamespaceMessages = {
     qcTitle: "Video quality check",
     qcRun: "Run QC",
     qcHint: "Automatically screen the finished video before publishing: black frames, long silence, loudness drift, frozen picture, stream integrity. A must-have gate for batch output.",
+    sheetTitle: "Contact sheet",
+    sheetRun: "Generate sheet",
+    sheetHint: "The whole video condensed into one image: an evenly-sampled filmstrip plus the audio waveform. Spot black frames, caption collisions, audio spikes and dead-air endings at a glance; click to enlarge.",
     qcPass: "QC passed — safe to publish",
     qcWarn: "QC has warnings — review before publishing",
     qcFail: "QC failed — do not publish as-is",
@@ -216,6 +225,9 @@ export const exportPage: NamespaceMessages = {
     exporting: "Exporting...",
     retryExport: "Retry export",
     exportFailed: "Export failed",
+    // advanced tools collapsible section
+    advancedTitle: "Advanced tools",
+    advancedHint: "Feedback · A/B testing · QC & compliance",
     abTitle: "A/B variants",
     abBadge: "In progress",
     abDesc: "Re-render one clip per caption-style + music combo to A/B which converts better (key-free; each takes ~1 min to recompose)",

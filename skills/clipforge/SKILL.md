@@ -21,7 +21,9 @@ ClipForge produces a finished vertical short video end to end. You drive it thro
 
 ## Three ways to create
 
-- **MCP tools** (in Claude Desktop / Cursor / Claude Code): `clipforge_create_video`, `clipforge_ingest_product`, `clipforge_product_script`, `clipforge_generate_script`, `clipforge_compose`, `clipforge_search_stock`, `clipforge_list_voices`, `clipforge_list_projects`, `clipforge_get_video`, `clipforge_trends`, `clipforge_import_script`, `clipforge_dub`, `clipforge_cover`, `clipforge_carousel`, `clipforge_shop_qr`, `clipforge_end_card`, `clipforge_qc`, `clipforge_credits`, `clipforge_native_feel`, `clipforge_preview_gif`, `clipforge_export_subtitle`.
+- **MCP tools** (in Claude Desktop / Cursor / Claude Code): `clipforge_create_video`, `clipforge_ingest_product`, `clipforge_product_script`, `clipforge_generate_script`, `clipforge_compose`, `clipforge_search_stock`, `clipforge_list_voices`, `clipforge_list_projects`, `clipforge_get_video`, `clipforge_trends`, `clipforge_import_script`, `clipforge_dub`, `clipforge_cover`, `clipforge_carousel`, `clipforge_shop_qr`, `clipforge_end_card`, `clipforge_qc`, `clipforge_credits`, `clipforge_native_feel`, `clipforge_preview_gif`, `clipforge_contact_sheet`, `clipforge_export_subtitle`.
+
+**Self-check before delivering**: after `clipforge_create_video` / `clipforge_compose` finishes, call `clipforge_contact_sheet` and *look* at the returned PNG (filmstrip + waveform) — black frames, caption collisions, audio spikes and dead-air endings are visible at a glance; run `clipforge_qc` for the automated metrics. Only tell the user the video is ready once both look clean.
 - **CLI**: `node bin/clipforge.mjs <create|product|import|compose|dub|cover|qr|endcard|qc|credits|native|carousel|list|voices|get|trends> [flags]` (`--help` for all).
 - **HTTP**: `POST /api/topic/script` → `POST /api/project/[id]/stock-fill` → `POST /api/project/[id]/compose` → poll `GET /api/project/[id]/compose`.
 
@@ -59,9 +61,17 @@ For documentary or science content, search the keyless public-domain sources exp
 | `voice` | Edge TTS voice id (see `clipforge_list_voices`) | free narration voice; auto-picked by topic language if omitted |
 | `bgm` + `bgmMood` | `upbeat`/`chill`/`energetic`/`emotional` | free CC background music, ducked under narration |
 | `karaoke` | boolean | word-by-word highlighted subtitles |
+| `captionPreset` | `standard` / `bold` / `minimal` / `karaoke` | caption look: translucent-boxed / big heavy-outline no-box punch / small thin-stroke minimal / per-word karaoke |
 | `productCard` | boolean | corner product card (e-commerce projects) |
 | `aiDisclosure` | boolean | burn an "AI-generated" compliance label |
 | `ctaText` | string | end-screen purchase CTA |
+
+## Combining with footage-editing skills
+
+ClipForge *generates* finished short videos; it pairs naturally with the raw-footage-editing skills of the 2026 agent ecosystem (trim / jump-cut / filler-word removal over the user's own recordings):
+
+- **Edited footage → ClipForge**: after another skill cuts the user's raw clips, upload the results as project materials (`POST /api/project/[id]/materials`, multipart) — auto-fill prefers uploaded footage and tops up with free stock, then ClipForge adds script-aligned voiceover, styled captions, BGM, product overlays and platform exports.
+- **ClipForge → post-processing**: the composed mp4 (from `clipforge_get_video`) is a normal H.264 file any editing skill can refine further; re-run `clipforge_qc` afterwards to re-check loudness/black-frame/silence health.
 
 ## Notes
 - Subtitles can be exported as SRT/WebVTT: `GET /api/project/[id]/subtitle?format=srt|vtt`.

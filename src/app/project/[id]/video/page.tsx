@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useParams } from "next/navigation";
 import { LuArrowLeft, LuPlay, LuChevronDown, LuArrowRight, LuLoaderCircle } from "react-icons/lu";
 import { useSettingsStore } from "@/lib/stores/settings-store";
@@ -13,6 +13,7 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { useT } from "@/lib/i18n";
 import { RENDER_PRESETS, DEFAULT_RENDER_PRESET, type RenderPreset } from "@/lib/compose-presets";
+import { BUILTIN_STYLE_PACKS, parseStylePack, serializeStylePack, type StylePack } from "@/lib/style-packs";
 import { LanguageToggle } from "@/components/language-toggle";
 import {
   Select,
@@ -45,15 +46,13 @@ interface ComposeConfig {
   resolution: "720p" | "1080p";
   /** 渲染质量预设：快速/标准/高清（决定分辨率 + 编码速度/质量） */
   renderPreset: RenderPreset;
-  /** 合规：烧 AI 生成标识（TikTok/抖音要求） */
-  aiDisclosure: boolean;
   /** 带货：片尾购买 CTA 贴片 */
   ctaEnabled: boolean;
   ctaText: string;
   /** 带货：左下角商品卡贴片（商品图缩略+名+购买引导，需商品图） */
   productCard: boolean;
-  /** 卡拉OK逐字高亮字幕（整句留屏，逐字随旁白变色） */
-  karaoke: boolean;
+  /** caption style preset: standard boxed / bold punch / minimal / word-by-word karaoke */
+  captionPreset: "standard" | "bold" | "minimal" | "karaoke";
   /** 旁白闪避：旁白一响自动压低 BGM、停顿回升，旁白更清晰 */
   bgmDuck: boolean;
 }
@@ -133,11 +132,10 @@ export default function VideoPage() {
     aspectRatio: "9:16",
     resolution: "1080p",
     renderPreset: DEFAULT_RENDER_PRESET,
-    aiDisclosure: false,
     ctaEnabled: false,
     ctaText: "", // 默认空，开启时按当前语言用 ctaPlaceholder 预填（避免英文用户拿到中文默认 CTA）
     productCard: false,
-    karaoke: false,
+    captionPreset: "standard",
     bgmDuck: false,
   });
 
@@ -262,6 +260,56 @@ export default function VideoPage() {
     );
   };
 
+  // style packs: declarative JSON recipes (caption preset / BGM / quality / CTA / product card).
+  // Novice-safe "external skill": pure data validated against a whitelist — nothing executable.
+  const packFileRef = useRef<HTMLInputElement>(null);
+  const [packNotice, setPackNotice] = useState<string | null>(null);
+
+  const applyStylePack = (pack: StylePack) => {
+    const p = pack.compose;
+    setConfig((c) => ({
+      ...c,
+      ...(p.captionPreset && { captionPreset: p.captionPreset }),
+      ...(p.bgm && { bgm: p.bgm }),
+      ...(p.bgmDuck !== undefined && { bgmDuck: p.bgmDuck }),
+      ...(p.quality && { renderPreset: p.quality, resolution: RENDER_PRESETS[p.quality].resolution }),
+      ...(p.aspectRatio && { aspectRatio: p.aspectRatio }),
+      ...(p.ctaText ? { ctaEnabled: true, ctaText: p.ctaText } : {}),
+      ...(p.productCard !== undefined && { productCard: p.productCard }),
+    }));
+    setPackNotice(t("stylePackApplied").replace("{name}", pack.name));
+  };
+
+  const importStylePack = async (file: File) => {
+    const pack = parseStylePack(await file.text());
+    if (!pack) {
+      setPackNotice(t("stylePackInvalid"));
+      return;
+    }
+    applyStylePack(pack);
+  };
+
+  const exportStylePack = () => {
+    const json = serializeStylePack({
+      name: projectName || "my-style",
+      compose: {
+        captionPreset: config.captionPreset,
+        bgm: config.bgm as StylePack["compose"]["bgm"],
+        bgmDuck: config.bgmDuck,
+        quality: config.renderPreset,
+        aspectRatio: config.aspectRatio,
+        ...(config.ctaEnabled && config.ctaText.trim() ? { ctaText: config.ctaText.trim() } : {}),
+        productCard: config.productCard,
+      },
+    });
+    const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "clipforge-style-pack.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   // 真实合成：调用 compose API 跑 FFmpeg，配乐观进度动画，完成后拿到真实 mp4
   const startCompose = async () => {
     setIsComposing(true);
@@ -284,10 +332,9 @@ export default function VideoPage() {
           resolution: config.resolution,
           renderPreset: config.renderPreset,
           aspectRatio: config.aspectRatio,
-          ...(config.aiDisclosure && { aiDisclosure: true }),
           ...(config.ctaEnabled && config.ctaText.trim() && { ctaText: config.ctaText.trim() }),
           ...(config.productCard && { productCard: true }),
-          ...(config.karaoke && { karaoke: true }),
+          ...(config.captionPreset !== "standard" && { captionPreset: config.captionPreset }),
           ...(config.bgmDuck && { bgmDuck: true }),
           ...(bgm?.path && { bgmPath: bgm.path }),
           // 没上传 BGM 且选了非 none 的配乐情绪 → 自动取一条该情绪的免费 CC 配乐（之前这里漏发，下拉形同虚设）
@@ -483,6 +530,52 @@ export default function VideoPage() {
           <div className="lg:col-span-1 space-y-4">
             <h2 className="text-base font-semibold">{t("composeSettings")}</h2>
 
+            {/* style packs: apply a whole look at once; import shared packs / export the current settings */}
+            <Card className="glass-card">
+              <CardContent className="p-4 space-y-3">
+                <Label className="text-sm font-medium">{t("stylePackLabel")}</Label>
+                <div className="grid grid-cols-2 gap-2">
+                  {BUILTIN_STYLE_PACKS.map((p) => (
+                    <button
+                      key={p.name}
+                      onClick={() => applyStylePack(p)}
+                      title={p.description}
+                      className="h-9 rounded-md text-xs border border-border/50 bg-muted/20 text-muted-foreground hover:border-primary/40 hover:text-primary transition-all px-1 truncate"
+                    >
+                      {p.name.split(" / ")[0]}
+                    </button>
+                  ))}
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => packFileRef.current?.click()}
+                    className="h-8 rounded-md text-xs border border-border/50 bg-muted/20 text-muted-foreground hover:border-primary/40 transition-all"
+                  >
+                    {t("stylePackImport")}
+                  </button>
+                  <button
+                    onClick={exportStylePack}
+                    className="h-8 rounded-md text-xs border border-border/50 bg-muted/20 text-muted-foreground hover:border-primary/40 transition-all"
+                  >
+                    {t("stylePackExport")}
+                  </button>
+                </div>
+                <input
+                  ref={packFileRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void importStylePack(f);
+                    e.target.value = ""; // allow re-importing the same file
+                  }}
+                />
+                {packNotice && <p className="text-[11px] text-primary">{packNotice}</p>}
+                <p className="text-[11px] text-muted-foreground">{t("stylePackHint")}</p>
+              </CardContent>
+            </Card>
+
             {/* 配音设置 */}
             <Card className="glass-card">
               <CardContent className="p-4 space-y-4">
@@ -592,32 +685,33 @@ export default function VideoPage() {
                     </button>
                   ))}
                 </div>
-                {/* 卡拉OK逐字高亮字幕（整句留屏，逐字随旁白变色，爆款字幕样式） */}
-                <div className="flex items-center justify-between pt-1">
-                  <span className="text-xs text-muted-foreground">{t("karaokeLabel")}</span>
-                  <button
-                    onClick={() => setConfig((c) => ({ ...c, karaoke: !c.karaoke }))}
-                    className={`relative w-10 h-5 rounded-full transition-colors ${config.karaoke ? "bg-primary" : "bg-muted"}`}
-                  >
-                    <div className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${config.karaoke ? "translate-x-5" : "translate-x-0.5"}`} />
-                  </button>
+                {/* caption style preset: standard boxed / bold punch / minimal / karaoke word-by-word */}
+                <div className="space-y-1.5 pt-1">
+                  <span className="text-xs text-muted-foreground">{t("captionStyleLabel")}</span>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(["standard", "bold", "minimal", "karaoke"] as const).map((preset) => (
+                      <button
+                        key={preset}
+                        onClick={() => setConfig((c) => ({ ...c, captionPreset: preset }))}
+                        className={`h-9 rounded-md text-xs border transition-all ${
+                          config.captionPreset === preset
+                            ? "border-primary bg-primary/10 text-primary"
+                            : "border-border/50 bg-muted/20 text-muted-foreground hover:border-primary/40"
+                        }`}
+                      >
+                        {t(`captionPreset_${preset}`)}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">{t(`captionPresetDesc_${config.captionPreset}`)}</p>
                 </div>
               </CardContent>
             </Card>
 
-            {/* 合规与转化：AI 生成标识 + 购买 CTA 片尾 */}
+            {/* 带货转化：购买 CTA 片尾 */}
             <Card className="glass-card">
               <CardContent className="p-4 space-y-3">
                 <Label className="text-sm font-medium">{t("complianceLabel")}</Label>
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-muted-foreground">{t("aiDisclosureLabel")}</span>
-                  <button
-                    onClick={() => setConfig((c) => ({ ...c, aiDisclosure: !c.aiDisclosure }))}
-                    className={`relative w-10 h-5 rounded-full transition-colors ${config.aiDisclosure ? "bg-primary" : "bg-muted"}`}
-                  >
-                    <div className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${config.aiDisclosure ? "translate-x-5" : "translate-x-0.5"}`} />
-                  </button>
-                </div>
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-muted-foreground">{t("ctaLabel")}</span>
                   <button

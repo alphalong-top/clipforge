@@ -1,13 +1,13 @@
 import { join, dirname } from "path";
 import { getDataDir } from "@/lib/paths";
 import { ffmpegBin } from "@/lib/ffmpeg-path";
-import { mkdir } from "fs/promises";
+import { mkdir, writeFile, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { TRANSITIONS, type TransitionMode } from "./transitions";
 import { MOTIONS, DEFAULT_MOTION } from "./motions";
 import { safeEncodeParams } from "@/lib/compose-presets";
 import { createLimiter } from "@/lib/concurrency";
-import { buildAigcMetadataArgs } from "@/lib/compliance-metadata";
+import { buildAigcMetadataArgs, buildAigcMetadataArgv } from "@/lib/compliance-metadata";
 import { CAPTION_SAFE_BOTTOM_RATIO, CAPTION_SAFE_BOTTOM_RATIO_NOCARD } from "./safe-zone";
 
 /**
@@ -159,12 +159,89 @@ export function wrapCaption(text: string, fontSize: number, frameWidth: number):
   return lines.join("\n");
 }
 
+/** Maximum number of rapid caption cards per narration segment */
+const MAX_CAPTION_CARDS = 8;
+/** Minimum readable on-screen time per caption card in seconds */
+const MIN_CARD_SECONDS = 0.6;
+
+/** Phrase-ending punctuation test: CJK + ASCII marks; ASCII "." only counts at a word boundary so decimals like "9.9" never split */
+function isPhrasePunct(ch: string, next: string | undefined): boolean {
+  if (/[。！？；，、：…!?;,]/.test(ch)) return true;
+  return ch === "." && (next === undefined || next === " ");
+}
+
+/** Split text into natural phrases at punctuation; each phrase keeps its trailing punctuation run (e.g. "！？" stays attached) */
+function splitPhrases(clean: string): string[] {
+  const chars = Array.from(clean);
+  const out: string[] = [];
+  let cur = "";
+  for (let i = 0; i < chars.length; i++) {
+    cur += chars[i];
+    const punct = isPhrasePunct(chars[i], chars[i + 1]);
+    const nextPunct = chars[i + 1] !== undefined && isPhrasePunct(chars[i + 1], chars[i + 2]);
+    // cut after the last punctuation of a consecutive run
+    if (punct && !nextPunct) {
+      const t = cur.trim();
+      if (t) out.push(t);
+      cur = "";
+    }
+  }
+  const tail = cur.trim();
+  if (tail) out.push(tail);
+  return out;
+}
+
+/** Display width of a card in "units": CJK char ≈ 1, Latin char ≈ 0.5 — used for merge thresholds */
+function cardWeight(s: string): number {
+  return Array.from(s).reduce((w, c) => w + (isCJK(c) ? 1 : 0.5), 0);
+}
+
 /**
- * Split a narration sentence into rapid "caption cards" distributed evenly within [startTime, endTime].
+ * Timing weight of a card: display width + punctuation pause bonus.
+ * TTS voices pause at punctuation, so cards containing commas/periods must own a larger
+ * share of the time window — otherwise captions run ahead of the actual speech.
+ */
+function timeWeight(s: string): number {
+  let w = 0;
+  for (const c of Array.from(s)) {
+    if (/[。！？…!?]/.test(c) || c === ".") w += 1.3; // sentence-final pause
+    else if (/[；，、：;,:]/.test(c)) w += 0.7; // mid-sentence pause
+    else w += isCJK(c) ? 1 : 0.5;
+  }
+  return Math.max(w, 1);
+}
+
+/** Distribute [startTime, endTime] across cards proportionally to their timing weight (last card lands exactly on endTime) */
+function allocateCardTimes(
+  cards: string[],
+  startTime: number,
+  endTime: number
+): { text: string; startTime: number; endTime: number }[] {
+  const total = Math.max(endTime - startTime, 0.1);
+  const weights = cards.map(timeWeight);
+  const sum = weights.reduce((a, b) => a + b, 0);
+  let acc = startTime;
+  return cards.map((c, i) => {
+    const s = acc;
+    acc = i === cards.length - 1 ? endTime : acc + (weights[i] / sum) * total;
+    return { text: c, startTime: Number(s.toFixed(3)), endTime: Number(acc.toFixed(3)) };
+  });
+}
+
+/**
+ * Split a narration sentence into rapid "caption cards" distributed within [startTime, endTime].
  * Rapid short captions are the 2026 standard for muted viewing / e-commerce retention,
  * replacing the pattern of displaying a full sentence statically for an entire shot.
- * Target: ~1.2s per card (max 8 cards); CJK splits per character, Latin splits per word;
- * time is allocated proportionally to card length.
+ *
+ * Splitting strategy (fixes GitHub issue #14 "captions cut mid-phrase"):
+ * 1. Cut at punctuation first — cards are natural phrases ("百事可乐，" / "冰爽加倍！"),
+ *    never mid-word fragments like "一口下去透心 / 凉";
+ * 2. Tiny fragments merge with a neighbour; if the card count exceeds what the time
+ *    window can show readably (≥0.6s per card, max 8), the shortest adjacent pair merges;
+ * 3. Text without any punctuation falls back to the legacy even split (CJK per character,
+ *    Latin per word, ~1.2s per card);
+ * 4. Time is allocated proportionally to card length + punctuation pause bonus, matching
+ *    the natural pacing of TTS narration.
  * Pure function for unit testing; the returned multi-segment subtitles are rendered by the
  * existing composer one segment at a time via drawtext (non-overlapping, one card shown at a time).
  */
@@ -176,7 +253,44 @@ export function chunkCaption(
   const clean = (text || "").replace(/\s+/g, " ").trim();
   if (!clean) return [];
   const total = Math.max(endTime - startTime, 0.1);
-  const n = Math.max(1, Math.min(Math.round(total / 1.2), 8));
+
+  const phrases = splitPhrases(clean);
+  if (phrases.length > 1) {
+    // budget: how many cards this time window can display readably
+    const maxCards = Math.max(1, Math.min(Math.floor(total / MIN_CARD_SECONDS), MAX_CAPTION_CARDS));
+    const cards = phrases.slice();
+    // merge tiny fragments (e.g. a lone "哇！") with the shorter neighbour
+    for (let i = 0; i < cards.length && cards.length > 1; ) {
+      if (cardWeight(cards[i]) >= 3) {
+        i++;
+        continue;
+      }
+      const mergeLeft = i > 0 && (i === cards.length - 1 || cardWeight(cards[i - 1]) <= cardWeight(cards[i + 1]));
+      if (mergeLeft) {
+        cards.splice(i - 1, 2, cards[i - 1] + cards[i]);
+        i = Math.max(i - 1, 0);
+      } else {
+        cards.splice(i, 2, cards[i] + cards[i + 1]);
+      }
+    }
+    // enforce the card-count budget by merging the lightest adjacent pair
+    while (cards.length > maxCards) {
+      let best = 0;
+      let bestW = Infinity;
+      for (let i = 0; i + 1 < cards.length; i++) {
+        const w = cardWeight(cards[i]) + cardWeight(cards[i + 1]);
+        if (w < bestW) {
+          bestW = w;
+          best = i;
+        }
+      }
+      cards.splice(best, 2, cards[best] + cards[best + 1]);
+    }
+    return allocateCardTimes(cards, startTime, endTime);
+  }
+
+  // legacy even split — text without punctuation (short hooks, single phrases)
+  const n = Math.max(1, Math.min(Math.round(total / 1.2), MAX_CAPTION_CARDS));
   if (n === 1) return [{ text: clean, startTime, endTime }];
   const cjk = /[぀-ヿ一-鿿가-힯]/.test(clean); // kana / CJK / hangul
   const units = cjk ? Array.from(clean) : clean.split(/\s+/);
@@ -184,14 +298,7 @@ export function chunkCaption(
   const per = Math.ceil(units.length / n);
   const chunks: string[] = [];
   for (let i = 0; i < units.length; i += per) chunks.push(units.slice(i, i + per).join(cjk ? "" : " "));
-  const lens = chunks.map((c) => Math.max(c.length, 1));
-  const sum = lens.reduce((a, b) => a + b, 0);
-  let acc = startTime;
-  return chunks.map((c, i) => {
-    const s = acc;
-    acc = i === chunks.length - 1 ? endTime : acc + (lens[i] / sum) * total;
-    return { text: c, startTime: Number(s.toFixed(3)), endTime: Number(acc.toFixed(3)) };
-  });
+  return allocateCardTimes(chunks, startTime, endTime);
 }
 
 /**
@@ -228,9 +335,13 @@ export interface ComposeConfig {
     /** absolute path to a Chinese font file (if omitted, the system Chinese font is auto-detected) */
     fontFile?: string;
     fontSize?: number;
+    /** font size as a ratio of frame width (used when fontSize is absent; default 0.05) */
+    fontSizeRatio?: number;
     color?: string;
     strokeColor?: string;
     strokeWidth?: number;
+    /** background box behind each caption: false = none, or a boxcolor string (default black@0.45) */
+    box?: false | { color: string };
     position?: "bottom" | "center" | "top";
     /** karaoke per-character subtitles (opt-in): providing a pre-built ASS file path switches to libass burn-in instead of per-sentence drawtext */
     karaokeAssPath?: string;
@@ -277,8 +388,43 @@ const SEGMENT_NORM = "format=yuv420p,setsar=1,fps=30,settb=AVTB";
 /** cross-fade duration in seconds for ffmpeg_fade transitions. video xfade / audio acrossfade / subtitle timeline must all use this same value; otherwise audio, video, and subtitles drift out of sync */
 export const FADE_DURATION = 0.5;
 
-// build the FFmpeg composition command
-export function buildComposeCommand(config: ComposeConfig): string {
+/** One ffmpeg `-i` input. loop/t reproduce the `-loop 1 [-t N]` flags used for still images / the product-card image. */
+interface InputSpec {
+  loop?: boolean;
+  t?: number;
+  path: string;
+}
+
+/** ffmpeg argv tokens for one input — raw path, no shell quoting (shell-free execFile path). */
+function inputToArgv(spec: InputSpec): string[] {
+  const a: string[] = [];
+  if (spec.loop) {
+    a.push("-loop", "1");
+    if (spec.t != null) a.push("-t", String(spec.t));
+  }
+  a.push("-i", spec.path);
+  return a;
+}
+
+/** Shell fragment for one input — path shell-escaped + double-quoted (legacy command-string form). */
+function inputToShell(spec: InputSpec): string {
+  const flags = spec.loop ? (spec.t != null ? `-loop 1 -t ${spec.t} ` : `-loop 1 `) : "";
+  return `${flags}-i "${escapeShellPath(spec.path)}"`;
+}
+
+interface ComposeGraph {
+  inputs: InputSpec[];
+  filterComplex: string; // pre-shell-escaped filtergraph, joined with ";\n"
+  videoStream: string;
+  audioStream: string; // "" when no clip carries audio
+  accumulated: number; // real output duration after xfade overlaps
+  outputPath: string;
+}
+
+// Assemble the ffmpeg composition graph (inputs / filtergraph / stream labels / duration) once;
+// buildComposeCommand renders it as a shell string (tests/debug) and buildComposeInvocation renders it
+// as shell-free argv + a -filter_complex_script payload (actual execution).
+function assembleComposeGraph(config: ComposeConfig): ComposeGraph {
   // empty clips would cause the subsequent -map "[v0]" to reference a stream that was never created, producing a cryptic ffmpeg error; fail early with a readable message instead
   if (!config.clips || config.clips.length === 0) {
     throw new Error("没有可合成的片段（clips 为空）——请先为分镜配好画面素材再合成");
@@ -287,7 +433,7 @@ export function buildComposeCommand(config: ComposeConfig): string {
   const outputDir = join(getDataDir(), "output", config.projectId);
   const outputPath = join(outputDir, `final_${Date.now()}.mp4`);
 
-  const inputs: string[] = [];
+  const inputs: InputSpec[] = [];
   const filterParts: string[] = [];
 
   // check whether any clip carries audio (native audio or TTS voice-over)
@@ -301,7 +447,7 @@ export function buildComposeCommand(config: ComposeConfig): string {
       // product image + motion effect. falls back to default motion when the motion key is invalid; never skips the clip
       // (otherwise the inputs/filter count would mismatch the [v${i}] references in the concat below, crashing ffmpeg)
       const motion = (clip.motion && MOTIONS[clip.motion]) || MOTIONS[DEFAULT_MOTION];
-      inputs.push(`-loop 1 -t ${clip.duration} -i "${escapeShellPath(clip.filePath)}"`);
+      inputs.push({ loop: true, t: clip.duration, path: clip.filePath });
       // key: zoompan outputs d frames per input frame. -loop produces many input frames which causes frame count explosion
       // and stretches the video tens of times longer than intended; use trim to grab only the first frame, then let
       // zoompan's d=duration*fps control total output frame count.
@@ -316,7 +462,7 @@ export function buildComposeCommand(config: ComposeConfig): string {
       // video clip: scale to fill + align to shot duration. real stock library videos (Wikimedia etc.) vary in length;
       // clips shorter than the shot duration would leave a black tail and cause audio/subtitle desync if only trimmed —
       // use tpad to clone the last frame up to the target duration, then trim, so each video clip is always exactly clip.duration.
-      inputs.push(`-i "${escapeShellPath(clip.filePath)}"`);
+      inputs.push({ path: clip.filePath });
       filterParts.push(`[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=30,tpad=stop_mode=clone:stop_duration=${clip.duration},trim=duration=${clip.duration},setpts=PTS-STARTPTS,${SEGMENT_NORM}[v${i}]`);
     }
   });
@@ -328,7 +474,7 @@ export function buildComposeCommand(config: ComposeConfig): string {
       if (clip.audioPath) {
         // TTS voice-over: added as an extra input, padded with silence / trimmed to clip duration
         const ai = inputs.length;
-        inputs.push(`-i "${escapeShellPath(clip.audioPath)}"`);
+        inputs.push({ path: clip.audioPath });
         audioParts.push(
           `[${ai}:a]aresample=44100,apad,atrim=duration=${clip.duration},asetpts=PTS-STARTPTS[a${i}]`
         );
@@ -394,7 +540,7 @@ export function buildComposeCommand(config: ComposeConfig): string {
   // BGM mixing: layered on top of clip audio
   if (config.output.bgmPath) {
     const bgmIndex = inputs.length; // resolved dynamically (TTS audio may have consumed several inputs already)
-    inputs.push(`-i "${escapeShellPath(config.output.bgmPath)}"`);
+    inputs.push({ path: config.output.bgmPath });
     const vol = config.output.bgmVolume ?? 0.3;
     // skip intro silence (opt-in, default 0): atrim drops the first N seconds then loops
     const introSkip = config.output.bgmIntroSkipSec ?? 0;
@@ -436,9 +582,14 @@ export function buildComposeCommand(config: ComposeConfig): string {
   } else if (config.subtitle?.texts.length) {
     const subtitleStream = `sub_out`;
     // font size adapts to frame width (~5%) so e-commerce subtitles are prominent; can be overridden via config
-    const fontSize = config.subtitle.fontSize || Math.round(width * 0.05);
+    const fontSize = config.subtitle.fontSize || Math.round(width * (config.subtitle.fontSizeRatio || 0.05));
     const fontColor = config.subtitle.color || "white";
     const borderW = config.subtitle.strokeWidth || 3;
+    // background box: opt-out via box:false (punch/minimal presets), custom colour via box.color
+    const boxOpt =
+      config.subtitle.box === false
+        ? undefined
+        : { color: config.subtitle.box?.color ?? "black@0.45", borderW: Math.round(fontSize * 0.35) };
     // multi-line-safe vertical anchor: bottom is pinned by the bottom edge of the text block (grows upward, never overflows);
     // center/top positions include text_h. bottom baseline is raised above the platform's bottom UI safe zone (avoids
     // the shopping-cart button / progress bar). with product card: pinned to 0.17 by the "card above, subtitle below" stack
@@ -463,7 +614,7 @@ export function buildComposeCommand(config: ComposeConfig): string {
           fontColor,
           borderW,
           lineSpacing,
-          box: { color: "black@0.45", borderW: Math.round(fontSize * 0.35) },
+          box: boxOpt,
           x: "(w-text_w)/2",
           y: yPos,
           enable: `enable='between(t,${t.startTime},${t.endTime})'`,
@@ -521,7 +672,7 @@ export function buildComposeCommand(config: ComposeConfig): string {
   // product card overlay (opt-in): bottom-left card = product thumbnail + name + purchase CTA, shown for ~5s at the start to simulate a "shopping cart link"
   if (config.productCard?.imagePath) {
     const cardIdx = inputs.length;
-    inputs.push(`-loop 1 -i "${escapeShellPath(config.productCard.imagePath)}"`);
+    inputs.push({ loop: true, path: config.productCard.imagePath });
     const thumb = Math.round(width * 0.16);
     const mx = Math.round(width * 0.045); // left margin
     const pad = Math.round(width * 0.022); // card inner padding
@@ -564,15 +715,47 @@ export function buildComposeCommand(config: ComposeConfig): string {
     currentAudioStream = "audio_norm";
   }
 
-  // assemble the full command
-  const inputStr = inputs.join(" ");
-  const filterStr = filterParts.join(";\n");
+  return {
+    inputs,
+    filterComplex: filterParts.join(";\n"),
+    videoStream: currentVideoStream,
+    audioStream: currentAudioStream,
+    accumulated,
+    outputPath,
+  };
+}
 
-  let cmd = `"${ffmpegBin()}" -y ${inputStr} -filter_complex "${filterStr}" -map "[${currentVideoStream}]"`;
+/**
+ * Convert the pre-shell-escaped filtergraph (built for an inline, double-quoted -filter_complex argument)
+ * into the form ffmpeg reads directly from a -filter_complex_script file. The only shell transform our
+ * filtergraph relies on is POSIX double-quote backslash-halving (\\ -> \): escapeDrawText deliberately
+ * doubles backslashes expecting the shell to halve them. Reading from a file (or passing via execFile)
+ * skips the shell, so we apply that halving ourselves. escapeSubtitlesPath emits single backslashes
+ * (\: \'), which contain no \\ pair and are left untouched — exactly as the shell leaves them.
+ *
+ * Exported because the sibling one-off overlay composers (cover / carousel / end-card) also run ffmpeg
+ * shell-free via execFile with the filtergraph as a raw argv element, so they need the same halving to
+ * turn buildDrawtext's pre-shell escaping into the ffmpeg-direct form.
+ */
+export function unshellFilter(filter: string): string {
+  return filter.replace(/\\\\/g, "\\");
+}
+
+/**
+ * Legacy shell-command string form — kept for tests / debugging and as the human-readable record of the
+ * exact ffmpeg invocation. NOT used to execute anymore: composeVideo runs ffmpeg shell-free via execFile
+ * (see buildComposeInvocation), which is what fixes the Windows failure. Paths are shell-quoted and the
+ * filtergraph stays in pre-shell form here (a real shell would halve its backslashes).
+ */
+export function buildComposeCommand(config: ComposeConfig): string {
+  const g = assembleComposeGraph(config);
+  const inputStr = g.inputs.map(inputToShell).join(" ");
+
+  let cmd = `"${ffmpegBin()}" -y ${inputStr} -filter_complex "${g.filterComplex}" -map "[${g.videoStream}]"`;
 
   // map audio output
-  if (currentAudioStream) {
-    cmd += ` -map "[${currentAudioStream}]"`;
+  if (g.audioStream) {
+    cmd += ` -map "[${g.audioStream}]"`;
   }
 
   // encoding parameters
@@ -584,9 +767,44 @@ export function buildComposeCommand(config: ComposeConfig): string {
   // content ID is derived from projectId (deterministic, assertable via ffprobe).
   const aigcArgs = buildAigcMetadataArgs({ contentId: config.projectId });
   // explicitly cap output duration to the real video timeline (accumulated): after xfade overlaps the video is shorter than the naive sum; prevents trailing audio playing over a frozen last frame
-  cmd += ` -c:a aac -b:a 256k -movflags +faststart ${aigcArgs} -t ${accumulated.toFixed(3)} "${escapeShellPath(outputPath)}"`;
+  cmd += ` -c:a aac -b:a 256k -movflags +faststart ${aigcArgs} -t ${g.accumulated.toFixed(3)} "${escapeShellPath(g.outputPath)}"`;
 
   return cmd;
+}
+
+/** Shell-free ffmpeg invocation: raw argv + a filtergraph in ffmpeg-direct form (fed via -filter_complex_script). */
+export interface ComposeInvocation {
+  /** ["-y", ...inputs] — raw paths, no shell quoting */
+  inputArgs: string[];
+  /** filtergraph in ffmpeg-direct form (shell backslash-halving already applied); write to a file for -filter_complex_script */
+  filterComplex: string;
+  /** maps + encode + metadata + -t + output path (the filter flag is spliced in by the caller) */
+  outputArgs: string[];
+  outputPath: string;
+}
+
+/**
+ * Build a shell-free ffmpeg invocation. The giant, newline-laden filtergraph is returned separately so the
+ * caller can write it to a file and pass it via -filter_complex_script; together with execFile (no shell)
+ * this sidesteps cmd.exe's 8191-char command-line cap, its embedded-newline breakage, and its backslash
+ * mangling of Windows paths — all of which made every compose fail on Windows (issue #13) while working on
+ * macOS/Linux.
+ */
+export function buildComposeInvocation(config: ComposeConfig): ComposeInvocation {
+  const g = assembleComposeGraph(config);
+  const enc = safeEncodeParams(config.output.videoPreset, config.output.crf);
+  const inputArgs = ["-y", ...g.inputs.flatMap(inputToArgv)];
+  const outputArgs = [
+    "-map", `[${g.videoStream}]`,
+    ...(g.audioStream ? ["-map", `[${g.audioStream}]`] : []),
+    "-c:v", "libx264", "-preset", enc.videoPreset, "-crf", String(enc.crf),
+    "-profile:v", "high", "-level:v", "4.2", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
+    ...buildAigcMetadataArgv({ contentId: config.projectId }),
+    "-t", g.accumulated.toFixed(3),
+    g.outputPath,
+  ];
+  return { inputArgs, filterComplex: unshellFilter(g.filterComplex), outputArgs, outputPath: g.outputPath };
 }
 
 /** maximum composition duration in milliseconds; the process is killed if exceeded to prevent a stuck render monopolising the machine indefinitely */
@@ -617,24 +835,37 @@ export async function composeVideo(config: ComposeConfig): Promise<string> {
   const outputDir = join(getDataDir(), "output", config.projectId);
   await mkdir(outputDir, { recursive: true });
 
-  const cmd = buildComposeCommand(config);
+  const inv = buildComposeInvocation(config);
 
-  const { exec } = await import("child_process");
+  // Write the (large, newline-laden) filtergraph to a script file and pass it via -filter_complex_script.
+  // Combined with execFile (no shell) this is the crux of the Windows fix (issue #13): a real 6-shot compose
+  // command is ~12k chars with ~23 embedded newlines, and running it through cmd.exe (as child_process.exec
+  // does on Windows) blew past its 8191-char command-line cap and choked on the newlines, so every final
+  // compose failed on Windows while working on macOS/Linux. execFile bypasses the shell entirely (no length
+  // cap, no quoting/backslash issues) and the script file keeps the argv small regardless of project size.
+  const filterFile = join(outputDir, `filter_${Date.now()}.txt`);
+  await writeFile(filterFile, inv.filterComplex, "utf8");
+  const args = [...inv.inputArgs, "-filter_complex_script", filterFile, ...inv.outputArgs];
+
+  const { execFile } = await import("child_process");
   const { promisify } = await import("util");
-  const execAsync = promisify(exec);
+  const execFileAsync = promisify(execFile);
 
   try {
-    // Only the expensive ffmpeg exec goes through the gate (cheap setup above runs unguarded);
-    // exec's timeout starts inside the limited fn, so time spent queueing never counts against it.
+    // Only the expensive ffmpeg run goes through the gate (cheap setup above runs unguarded);
+    // execFile's timeout starts inside the limited fn, so time spent queueing never counts against it.
     // apply timeout (sends SIGTERM if exceeded); disk-full / timeout errors are mapped to readable messages
-    await composeLimiter(() => execAsync(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: COMPOSE_TIMEOUT_MS }));
+    await composeLimiter(() =>
+      execFileAsync(ffmpegBin(), args, { maxBuffer: 50 * 1024 * 1024, timeout: COMPOSE_TIMEOUT_MS })
+    );
   } catch (e) {
     const friendly = composeErrorMessage(e as { killed?: boolean; signal?: string; stderr?: string; message?: string });
     if (friendly) throw new Error(friendly);
     throw e;
+  } finally {
+    // Best-effort cleanup of the transient filtergraph script (kept out of the finished-video listing).
+    await rm(filterFile, { force: true }).catch(() => {});
   }
 
-  // extract output path from the command string
-  const outputMatch = cmd.match(/"([^"]*final_[^"]*\.mp4)"/);
-  return outputMatch ? outputMatch[1] : "";
+  return inv.outputPath;
 }
